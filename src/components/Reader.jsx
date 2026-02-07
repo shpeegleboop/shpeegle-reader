@@ -1,6 +1,6 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import ePub from 'epubjs';
+import JSZip from 'jszip';
 import {
   ArrowLeft,
   ChevronLeft,
@@ -13,6 +13,7 @@ import {
   Minimize2,
   BookOpen,
   X,
+  AlertCircle,
 } from 'lucide-react';
 
 const FONTS = [
@@ -21,15 +22,219 @@ const FONTS = [
   { label: 'System', value: "system-ui, sans-serif" },
 ];
 
-export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress }) {
-  const viewerRef = useRef(null);
-  const renditionRef = useRef(null);
-  const bookRef = useRef(null);
-  const tocRef = useRef([]);
+/* ── Path helpers ─────────────────────────────────────────── */
 
-  const [currentChapter, setCurrentChapter] = useState('');
+function normalizePath(path) {
+  const parts = path.split('/').filter(Boolean);
+  const stack = [];
+  for (const p of parts) {
+    if (p === '..') stack.pop();
+    else if (p !== '.') stack.push(p);
+  }
+  return stack.join('/');
+}
+
+function dirOf(path) {
+  const i = path.lastIndexOf('/');
+  return i >= 0 ? path.substring(0, i + 1) : '';
+}
+
+function resolveHref(basePath, href) {
+  if (!href) return '';
+  if (href.startsWith('/')) return normalizePath(href);
+  return normalizePath(dirOf(basePath) + href);
+}
+
+/* ── Epub parsing with JSZip ──────────────────────────────── */
+
+async function parseEpub(buffer) {
+  const zip = await JSZip.loadAsync(buffer);
+
+  // 1. Find OPF via container.xml
+  const containerXml = await zip.file('META-INF/container.xml')?.async('text');
+  if (!containerXml) throw new Error('Invalid epub: missing container.xml');
+  const containerDoc = new DOMParser().parseFromString(containerXml, 'application/xml');
+  const opfPath = containerDoc.querySelector('rootfile')?.getAttribute('full-path');
+  if (!opfPath) throw new Error('Invalid epub: no rootfile found');
+
+  // 2. Parse OPF
+  const opfXml = await zip.file(opfPath)?.async('text');
+  if (!opfXml) throw new Error('Invalid epub: missing OPF');
+  const opfDoc = new DOMParser().parseFromString(opfXml, 'application/xml');
+
+  // Build manifest: id -> { href, mediaType, fullPath, properties }
+  const manifest = {};
+  for (const item of opfDoc.querySelectorAll('manifest item')) {
+    const id = item.getAttribute('id');
+    const href = item.getAttribute('href');
+    manifest[id] = {
+      href,
+      mediaType: item.getAttribute('media-type') || '',
+      properties: item.getAttribute('properties') || '',
+      fullPath: resolveHref(opfPath, href),
+    };
+  }
+
+  // Build spine (reading order)
+  const spine = [];
+  for (const ref of opfDoc.querySelectorAll('spine itemref')) {
+    const idref = ref.getAttribute('idref');
+    if (manifest[idref]) spine.push({ id: idref, ...manifest[idref] });
+  }
+
+  // 3. Parse TOC — try NCX first, then epub3 NAV
+  let toc = [];
+  const ncxItem = Object.values(manifest).find(
+    (m) => m.mediaType === 'application/x-dtbncx+xml'
+  );
+  if (ncxItem) {
+    try {
+      const ncxXml = await zip.file(ncxItem.fullPath)?.async('text');
+      if (ncxXml) {
+        const ncxDoc = new DOMParser().parseFromString(ncxXml, 'application/xml');
+        toc = parseNcxPoints(
+          ncxDoc.querySelectorAll('navMap > navPoint'),
+          ncxItem.fullPath
+        );
+      }
+    } catch {}
+  }
+  if (!toc.length) {
+    const navItem = Object.values(manifest).find((m) =>
+      m.properties.includes('nav')
+    );
+    if (navItem) {
+      try {
+        const navXml = await zip.file(navItem.fullPath)?.async('text');
+        if (navXml) {
+          const navDoc = new DOMParser().parseFromString(navXml, 'application/xhtml+xml');
+          const navEl =
+            navDoc.querySelector('nav[epub\\:type="toc"]') ||
+            navDoc.querySelector('nav');
+          if (navEl) {
+            toc = parseNavOl(navEl.querySelector('ol'), navItem.fullPath);
+          }
+        }
+      } catch {}
+    }
+  }
+
+  return { zip, spine, manifest, toc };
+}
+
+function parseNcxPoints(points, ncxPath) {
+  const items = [];
+  for (const np of points) {
+    const label = np.querySelector(':scope > navLabel > text')?.textContent?.trim() || '';
+    const src = np.querySelector(':scope > content')?.getAttribute('src') || '';
+    const children = np.querySelectorAll(':scope > navPoint');
+    items.push({
+      label,
+      href: resolveHref(ncxPath, src),
+      subitems: children.length ? parseNcxPoints(children, ncxPath) : [],
+    });
+  }
+  return items;
+}
+
+function parseNavOl(ol, navPath) {
+  if (!ol) return [];
+  const items = [];
+  for (const li of ol.querySelectorAll(':scope > li')) {
+    const a = li.querySelector(':scope > a');
+    if (!a) continue;
+    const subOl = li.querySelector(':scope > ol');
+    items.push({
+      label: a.textContent?.trim() || '',
+      href: resolveHref(navPath, a.getAttribute('href') || ''),
+      subitems: subOl ? parseNavOl(subOl, navPath) : [],
+    });
+  }
+  return items;
+}
+
+/* ── Chapter content loading ──────────────────────────────── */
+
+function blobToDataUrl(blob) {
+  return new Promise((res) => {
+    const r = new FileReader();
+    r.onloadend = () => res(r.result);
+    r.readAsDataURL(blob);
+  });
+}
+
+async function loadChapter(zip, spineItem) {
+  const raw = await zip.file(spineItem.fullPath)?.async('text');
+  if (!raw) return '<p style="color:#9090a0;text-align:center;padding:2em;">Chapter not found.</p>';
+
+  // Parse XHTML; fall back to HTML if malformed
+  let doc = new DOMParser().parseFromString(raw, 'application/xhtml+xml');
+  if (doc.querySelector('parsererror')) {
+    doc = new DOMParser().parseFromString(raw, 'text/html');
+  }
+
+  const body = doc.querySelector('body') || doc.documentElement;
+
+  // Strip original stylesheets — we apply our own dark theme
+  for (const el of doc.querySelectorAll('style, link[rel="stylesheet"]')) {
+    el.remove();
+  }
+  // Strip inline styles that would override our theme
+  for (const el of body.querySelectorAll('[style]')) {
+    el.removeAttribute('style');
+  }
+
+  // Convert <img> src to data URIs
+  const itemDir = dirOf(spineItem.fullPath);
+  for (const img of body.querySelectorAll('img')) {
+    const src = img.getAttribute('src');
+    if (!src || src.startsWith('data:')) continue;
+    const fullPath = normalizePath(itemDir + src);
+    const file = zip.file(fullPath);
+    if (file) {
+      try {
+        const blob = await file.async('blob');
+        img.setAttribute('src', await blobToDataUrl(blob));
+      } catch {}
+    }
+  }
+
+  // Convert SVG <image> href to data URIs
+  for (const img of body.querySelectorAll('image')) {
+    const href = img.getAttribute('xlink:href') || img.getAttribute('href');
+    if (!href || href.startsWith('data:')) continue;
+    const fullPath = normalizePath(itemDir + href);
+    const file = zip.file(fullPath);
+    if (file) {
+      try {
+        const blob = await file.async('blob');
+        const dataUrl = await blobToDataUrl(blob);
+        img.setAttribute('xlink:href', dataUrl);
+        img.setAttribute('href', dataUrl);
+      } catch {}
+    }
+  }
+
+  return body.innerHTML;
+}
+
+/* ── Reader Component ─────────────────────────────────────── */
+
+export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress }) {
+  const contentRef = useRef(null);
+
+  const [epubData, setEpubData] = useState(null);
+  const [chapterIndex, setChapterIndex] = useState(0);
+  const [chapterHtml, setChapterHtml] = useState('');
+  const [chapterLoading, setChapterLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [currentLabel, setCurrentLabel] = useState('');
+
   const [showToc, setShowToc] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [isFullWidth, setIsFullWidth] = useState(false);
+
   const [fontSize, setFontSize] = useState(() => {
     try { return parseInt(localStorage.getItem('shpeegle-fontsize')) || 18; } catch { return 18; }
   });
@@ -39,14 +244,12 @@ export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress })
   const [lineHeight, setLineHeight] = useState(() => {
     try { return parseFloat(localStorage.getItem('shpeegle-lineheight')) || 1.8; } catch { return 1.8; }
   });
-  const [progress, setProgress] = useState(0);
-  const [isFullWidth, setIsFullWidth] = useState(false);
-  const [atStart, setAtStart] = useState(true);
-  const [atEnd, setAtEnd] = useState(false);
-  const [toc, setToc] = useState([]);
-  const [isReady, setIsReady] = useState(false);
 
-  // Save settings
+  const progress = epubData
+    ? (chapterIndex + 1) / epubData.spine.length
+    : 0;
+
+  // Persist settings
   useEffect(() => {
     try {
       localStorage.setItem('shpeegle-fontsize', fontSize);
@@ -55,168 +258,98 @@ export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress })
     } catch {}
   }, [fontSize, fontFamily, lineHeight]);
 
-  // Apply styles to rendition
-  const applyStyles = useCallback((rendition) => {
-    if (!rendition) return;
-    rendition.themes.default({
-      'html, body': {
-        background: '#0a0a0c !important',
-        color: '#e4e4ec !important',
-      },
-      'body': {
-        'font-family': `${fontFamily} !important`,
-        'font-size': `${fontSize}px !important`,
-        'line-height': `${lineHeight} !important`,
-        'padding': '0 !important',
-        'margin': '0 !important',
-      },
-      'p, li, td, th, dd, dt, span': {
-        'font-family': `${fontFamily} !important`,
-        'font-size': `${fontSize}px !important`,
-        'line-height': `${lineHeight} !important`,
-        'color': '#e4e4ec !important',
-      },
-      'h1, h2, h3, h4, h5, h6': {
-        'font-family': "'Inter', system-ui, sans-serif !important",
-        'color': '#f4f4fa !important',
-        'margin-top': '1.5em !important',
-        'margin-bottom': '0.5em !important',
-      },
-      'h1': { 'font-size': '1.6em !important' },
-      'h2': { 'font-size': '1.35em !important' },
-      'h3': { 'font-size': '1.15em !important' },
-      'a': { 'color': '#8b5cf6 !important' },
-      'a:hover': { 'color': '#a78bfa !important' },
-      'img': {
-        'max-width': '100% !important',
-        'height': 'auto !important',
-        'border-radius': '4px',
-      },
-      'blockquote': {
-        'border-left': '3px solid #7c3aed !important',
-        'padding-left': '1em !important',
-        'margin-left': '0 !important',
-        'color': '#9090a0 !important',
-        'font-style': 'italic',
-      },
-      'pre, code': {
-        'background': '#1a1a1f !important',
-        'color': '#e4e4ec !important',
-        'border-radius': '4px !important',
-        'padding': '0.2em 0.4em !important',
-        'font-size': '0.9em !important',
-      },
-      'table': {
-        'border-collapse': 'collapse !important',
-      },
-      'td, th': {
-        'border': '1px solid #2a2a32 !important',
-        'padding': '0.5em !important',
-      },
-      'hr': {
-        'border': 'none !important',
-        'border-top': '1px solid #2a2a32 !important',
-        'margin': '2em 0 !important',
-      },
-      '::selection': {
-        'background': 'rgba(124, 58, 237, 0.3) !important',
-      },
-    });
-  }, [fontSize, fontFamily, lineHeight]);
-
-  // Initialize book
+  // Parse epub on mount
   useEffect(() => {
-    if (!bookData || !viewerRef.current) return;
-
-    const book = ePub(bookData.buffer);
-    bookRef.current = book;
-
-    const rendition = book.renderTo(viewerRef.current, {
-      width: '100%',
-      height: '100%',
-      spread: 'none',
-      flow: 'paginated',
-    });
-    renditionRef.current = rendition;
-
-    applyStyles(rendition);
-
-    // Load TOC
-    book.loaded.navigation.then((nav) => {
-      tocRef.current = nav.toc;
-      setToc(nav.toc);
-    });
-
-    // Display book (resume from saved position or start)
-    const startCfi = bookMeta?.currentCfi;
-    if (startCfi) {
-      rendition.display(startCfi);
-    } else {
-      rendition.display();
-    }
-
-    rendition.on('rendered', () => {
-      setIsReady(true);
-    });
-
-    // Track location changes
-    rendition.on('relocated', (location) => {
-      const pct = book.locations?.percentageFromCfi?.(location.start.cfi) ?? 0;
-      setProgress(pct);
-      setAtStart(location.atStart);
-      setAtEnd(location.atEnd);
-      onUpdateProgress?.(location.start.cfi, pct);
-
-      // Find current chapter
-      const href = location.start.href;
-      const findChapter = (items) => {
-        for (const item of items) {
-          if (item.href && href.includes(item.href.split('#')[0])) return item.label?.trim();
-          if (item.subitems?.length) {
-            const found = findChapter(item.subitems);
-            if (found) return found;
-          }
-        }
-        return null;
-      };
-      setCurrentChapter(findChapter(tocRef.current) || '');
-    });
-
-    // Generate locations for progress
-    book.ready.then(() => {
-      return book.locations.generate(1024);
-    });
-
-    // Keyboard nav
-    rendition.on('keydown', (e) => {
-      if (e.key === 'ArrowRight' || e.key === ' ') rendition.next();
-      if (e.key === 'ArrowLeft') rendition.prev();
-    });
-
-    return () => {
-      rendition.destroy();
-      book.destroy();
-    };
+    if (!bookData?.buffer) return;
+    setLoading(true);
+    setError(null);
+    const buf = bookData.buffer.slice ? bookData.buffer.slice(0) : bookData.buffer;
+    parseEpub(buf)
+      .then((data) => {
+        setEpubData(data);
+        // Restore saved position (we store chapter index as the "cfi")
+        const saved = bookMeta?.currentCfi;
+        const startIdx =
+          typeof saved === 'number' && saved >= 0 && saved < data.spine.length
+            ? saved
+            : 0;
+        setChapterIndex(startIdx);
+        setLoading(false);
+      })
+      .catch((err) => {
+        console.error('Epub parse error:', err);
+        setError(err.message || 'Could not parse this epub file.');
+        setLoading(false);
+      });
   }, [bookData]);
 
-  // Re-apply styles when settings change
+  // Load chapter content when chapterIndex or epubData changes
   useEffect(() => {
-    if (renditionRef.current && isReady) {
-      applyStyles(renditionRef.current);
-    }
-  }, [fontSize, fontFamily, lineHeight, applyStyles, isReady]);
+    if (!epubData) return;
+    const item = epubData.spine[chapterIndex];
+    if (!item) return;
 
-  const goNext = () => renditionRef.current?.next();
-  const goPrev = () => renditionRef.current?.prev();
-  const goToHref = (href) => {
-    renditionRef.current?.display(href);
-    setShowToc(false);
-  };
+    setChapterLoading(true);
+    loadChapter(epubData.zip, item)
+      .then((html) => {
+        setChapterHtml(html);
+        setChapterLoading(false);
+        // Scroll to top of new chapter
+        contentRef.current?.scrollTo(0, 0);
+        // Report progress
+        const pct = (chapterIndex + 1) / epubData.spine.length;
+        onUpdateProgress?.(chapterIndex, pct);
+        // Find chapter label in TOC
+        const basePath = item.fullPath.split('#')[0];
+        const findLabel = (items) => {
+          for (const t of items) {
+            if (t.href.split('#')[0] === basePath) return t.label;
+            if (t.subitems?.length) {
+              const found = findLabel(t.subitems);
+              if (found) return found;
+            }
+          }
+          return null;
+        };
+        setCurrentLabel(
+          findLabel(epubData.toc) ||
+          `${chapterIndex + 1} / ${epubData.spine.length}`
+        );
+      })
+      .catch(() => {
+        setChapterHtml('<p style="color:#9090a0;padding:2em;text-align:center;">Failed to load chapter.</p>');
+        setChapterLoading(false);
+      });
+  }, [epubData, chapterIndex]);
 
-  // Keyboard handler for main window
+  // Navigation
+  const goPrev = useCallback(() => {
+    setChapterIndex((i) => Math.max(0, i - 1));
+  }, []);
+
+  const goNext = useCallback(() => {
+    setChapterIndex((i) =>
+      Math.min((epubData?.spine.length || 1) - 1, i + 1)
+    );
+  }, [epubData]);
+
+  const goToHref = useCallback(
+    (href) => {
+      if (!epubData) return;
+      const basePath = href.split('#')[0];
+      const idx = epubData.spine.findIndex(
+        (s) => s.fullPath.split('#')[0] === basePath
+      );
+      if (idx >= 0) setChapterIndex(idx);
+      setShowToc(false);
+    },
+    [epubData]
+  );
+
+  // Keyboard navigation
   useEffect(() => {
     const handleKey = (e) => {
-      if (e.key === 'ArrowRight' || e.key === ' ') { e.preventDefault(); goNext(); }
+      if (e.key === 'ArrowRight') { e.preventDefault(); goNext(); }
       if (e.key === 'ArrowLeft') { e.preventDefault(); goPrev(); }
       if (e.key === 'Escape') {
         if (showToc) setShowToc(false);
@@ -225,16 +358,125 @@ export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress })
     };
     window.addEventListener('keydown', handleKey);
     return () => window.removeEventListener('keydown', handleKey);
-  }, [showToc, showSettings]);
+  }, [showToc, showSettings, goNext, goPrev]);
+
+  // Dynamic dark theme CSS for epub content
+  const contentStyles = useMemo(
+    () => `
+    .epub-body {
+      color: #e4e4ec;
+      font-family: ${fontFamily};
+      font-size: ${fontSize}px;
+      line-height: ${lineHeight};
+      padding: 40px 48px 80px;
+      max-width: 100%;
+      word-wrap: break-word;
+      overflow-wrap: break-word;
+    }
+    .epub-body * { max-width: 100%; box-sizing: border-box; }
+    .epub-body p, .epub-body li, .epub-body td, .epub-body th,
+    .epub-body dd, .epub-body dt, .epub-body figcaption { color: #e4e4ec; }
+    .epub-body span { color: inherit; }
+    .epub-body h1, .epub-body h2, .epub-body h3,
+    .epub-body h4, .epub-body h5, .epub-body h6 {
+      font-family: 'Inter', system-ui, sans-serif;
+      color: #f4f4fa;
+      margin-top: 1.5em;
+      margin-bottom: 0.5em;
+    }
+    .epub-body h1 { font-size: 1.6em; }
+    .epub-body h2 { font-size: 1.35em; }
+    .epub-body h3 { font-size: 1.15em; }
+    .epub-body a { color: #8b5cf6; text-decoration: none; }
+    .epub-body a:hover { text-decoration: underline; }
+    .epub-body img {
+      max-width: 100%; height: auto;
+      border-radius: 4px;
+      display: block;
+      margin: 1em auto;
+    }
+    .epub-body svg { max-width: 100%; height: auto; }
+    .epub-body blockquote {
+      border-left: 3px solid #7c3aed;
+      padding-left: 1em;
+      margin-left: 0;
+      color: #9090a0;
+      font-style: italic;
+    }
+    .epub-body pre, .epub-body code {
+      background: #1a1a1f;
+      color: #e4e4ec;
+      border-radius: 4px;
+      font-size: 0.9em;
+    }
+    .epub-body pre { padding: 1em; overflow-x: auto; }
+    .epub-body code { padding: 0.15em 0.3em; }
+    .epub-body table { border-collapse: collapse; width: 100%; }
+    .epub-body td, .epub-body th {
+      border: 1px solid #2a2a32;
+      padding: 0.5em;
+    }
+    .epub-body hr {
+      border: none;
+      border-top: 1px solid #2a2a32;
+      margin: 2em 0;
+    }
+    .epub-body p { margin: 0.8em 0; }
+    .epub-body ul, .epub-body ol { padding-left: 1.5em; }
+    .epub-body li { margin: 0.3em 0; }
+    .epub-body figure { margin: 1em 0; text-align: center; }
+    .epub-body figcaption { font-size: 0.85em; color: #9090a0; margin-top: 0.5em; }
+    .epub-body sup, .epub-body sub { font-size: 0.75em; }
+    .epub-body em { font-style: italic; }
+    .epub-body strong, .epub-body b { color: #f4f4fa; font-weight: 600; }
+    .epub-body div { color: inherit; }
+    .epub-body section { color: inherit; }
+  `,
+    [fontFamily, fontSize, lineHeight]
+  );
+
+  // Error state
+  if (error) {
+    return (
+      <div className="h-full flex flex-col bg-void">
+        <div className="flex items-center px-4 py-2.5 border-b border-border bg-abyss/80">
+          <button
+            onClick={onBack}
+            className="p-2 rounded-lg text-muted hover:text-bright hover:bg-surface transition-colors"
+          >
+            <ArrowLeft size={18} />
+          </button>
+        </div>
+        <div className="flex-1 flex items-center justify-center">
+          <div className="text-center p-8 max-w-sm">
+            <div className="w-14 h-14 rounded-2xl bg-crimson-muted/50 border border-crimson/30 flex items-center justify-center mx-auto mb-4">
+              <AlertCircle size={24} className="text-crimson-glow" />
+            </div>
+            <h3 className="text-lg font-semibold text-bright mb-2">Couldn't open book</h3>
+            <p className="text-sm text-muted mb-6">{error}</p>
+            <button
+              onClick={onBack}
+              className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-purple text-white text-sm font-medium hover:bg-purple-dim transition-colors"
+            >
+              <ArrowLeft size={16} /> Back to Library
+            </button>
+          </div>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="h-full flex flex-col bg-void">
+      <style dangerouslySetInnerHTML={{ __html: contentStyles }} />
+
       {/* Top bar */}
       <div className="flex items-center justify-between px-4 py-2.5 border-b border-border bg-abyss/80 backdrop-blur-sm z-20 flex-shrink-0">
         <div className="flex items-center gap-2">
           <button
             onClick={onBack}
             className="p-2 rounded-lg text-muted hover:text-bright hover:bg-surface transition-colors"
+            title="Back to library"
           >
             <ArrowLeft size={18} />
           </button>
@@ -242,8 +484,8 @@ export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress })
             <h2 className="text-sm font-medium text-bright leading-tight line-clamp-1 max-w-[300px]">
               {bookMeta?.title || 'Untitled'}
             </h2>
-            {currentChapter && (
-              <p className="text-xs text-muted line-clamp-1">{currentChapter}</p>
+            {currentLabel && (
+              <p className="text-xs text-muted line-clamp-1">{currentLabel}</p>
             )}
           </div>
         </div>
@@ -252,26 +494,29 @@ export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress })
           <button
             onClick={() => { setShowToc(!showToc); setShowSettings(false); }}
             className={`p-2 rounded-lg transition-colors ${showToc ? 'text-purple-glow bg-purple-muted/30' : 'text-muted hover:text-bright hover:bg-surface'}`}
+            title="Table of Contents"
           >
             <List size={18} />
           </button>
           <button
             onClick={() => { setShowSettings(!showSettings); setShowToc(false); }}
             className={`p-2 rounded-lg transition-colors ${showSettings ? 'text-purple-glow bg-purple-muted/30' : 'text-muted hover:text-bright hover:bg-surface'}`}
+            title="Reading settings"
           >
             <Type size={18} />
           </button>
           <button
             onClick={() => setIsFullWidth(!isFullWidth)}
             className="p-2 rounded-lg text-muted hover:text-bright hover:bg-surface transition-colors"
+            title={isFullWidth ? 'Narrow view' : 'Wide view'}
           >
             {isFullWidth ? <Minimize2 size={18} /> : <Maximize2 size={18} />}
           </button>
         </div>
       </div>
 
-      {/* Main reading area */}
-      <div className="flex-1 flex relative overflow-hidden">
+      {/* Main area */}
+      <div className="flex-1 flex relative min-h-0 overflow-hidden">
         {/* TOC panel */}
         <AnimatePresence>
           {showToc && (
@@ -284,15 +529,12 @@ export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress })
             >
               <div className="flex items-center justify-between px-4 py-3 border-b border-border">
                 <h3 className="text-sm font-semibold text-bright">Table of Contents</h3>
-                <button
-                  onClick={() => setShowToc(false)}
-                  className="p-1 rounded text-muted hover:text-bright"
-                >
+                <button onClick={() => setShowToc(false)} className="p-1 rounded text-muted hover:text-bright">
                   <X size={16} />
                 </button>
               </div>
               <div className="flex-1 overflow-y-auto py-2">
-                <TocTree items={toc} onSelect={goToHref} level={0} />
+                <TocTree items={epubData?.toc || []} onSelect={goToHref} level={0} />
               </div>
             </motion.div>
           )}
@@ -310,19 +552,14 @@ export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress })
             >
               <div className="flex items-center justify-between px-4 py-3 border-b border-border">
                 <h3 className="text-sm font-semibold text-bright">Reading Settings</h3>
-                <button
-                  onClick={() => setShowSettings(false)}
-                  className="p-1 rounded text-muted hover:text-bright"
-                >
+                <button onClick={() => setShowSettings(false)} className="p-1 rounded text-muted hover:text-bright">
                   <X size={16} />
                 </button>
               </div>
               <div className="p-4 space-y-6">
                 {/* Font size */}
                 <div>
-                  <label className="text-xs text-muted uppercase tracking-wider font-medium block mb-2">
-                    Font Size
-                  </label>
+                  <label className="text-xs text-muted uppercase tracking-wider font-medium block mb-2">Font Size</label>
                   <div className="flex items-center gap-3">
                     <button
                       onClick={() => setFontSize((s) => Math.max(12, s - 1))}
@@ -339,12 +576,9 @@ export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress })
                     </button>
                   </div>
                 </div>
-
                 {/* Font family */}
                 <div>
-                  <label className="text-xs text-muted uppercase tracking-wider font-medium block mb-2">
-                    Font
-                  </label>
+                  <label className="text-xs text-muted uppercase tracking-wider font-medium block mb-2">Font</label>
                   <div className="flex flex-col gap-2">
                     {FONTS.map((f) => (
                       <button
@@ -362,12 +596,9 @@ export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress })
                     ))}
                   </div>
                 </div>
-
                 {/* Line height */}
                 <div>
-                  <label className="text-xs text-muted uppercase tracking-wider font-medium block mb-2">
-                    Line Height
-                  </label>
+                  <label className="text-xs text-muted uppercase tracking-wider font-medium block mb-2">Line Height</label>
                   <input
                     type="range"
                     min="1.2"
@@ -388,45 +619,63 @@ export default function Reader({ bookData, bookMeta, onBack, onUpdateProgress })
           )}
         </AnimatePresence>
 
-        {/* Prev page click zone */}
-        <button
-          onClick={goPrev}
-          disabled={atStart}
-          className="absolute left-0 top-0 bottom-0 w-16 z-[5] flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity group"
+        {/* Reader content */}
+        <div
+          ref={contentRef}
+          className={`flex-1 min-h-0 overflow-y-auto transition-all duration-300 ${
+            isFullWidth ? '' : 'mx-auto max-w-3xl'
+          } w-full`}
+          style={{ background: '#0a0a0c' }}
         >
-          <div className="p-2 rounded-full bg-surface/80 border border-border text-muted group-hover:text-bright">
-            <ChevronLeft size={20} />
-          </div>
-        </button>
-
-        {/* Epub viewport */}
-        <div className={`flex-1 transition-all duration-300 ${isFullWidth ? 'mx-0' : 'mx-auto max-w-3xl'}`}>
-          <div ref={viewerRef} className="h-full" />
+          {loading || chapterLoading ? (
+            <div className="w-full h-full flex items-center justify-center">
+              <div className="flex flex-col items-center gap-3">
+                <div className="w-8 h-8 border-2 border-purple/30 border-t-purple-glow rounded-full animate-spin" />
+                <p className="text-xs text-muted">
+                  {loading ? 'Opening book...' : 'Loading chapter...'}
+                </p>
+              </div>
+            </div>
+          ) : (
+            <div
+              className="epub-body"
+              dangerouslySetInnerHTML={{ __html: chapterHtml }}
+            />
+          )}
         </div>
-
-        {/* Next page click zone */}
-        <button
-          onClick={goNext}
-          disabled={atEnd}
-          className="absolute right-0 top-0 bottom-0 w-16 z-[5] flex items-center justify-center opacity-0 hover:opacity-100 transition-opacity group"
-        >
-          <div className="p-2 rounded-full bg-surface/80 border border-border text-muted group-hover:text-bright">
-            <ChevronRight size={20} />
-          </div>
-        </button>
       </div>
 
-      {/* Bottom progress bar */}
+      {/* Bottom bar */}
       <div className="flex items-center gap-3 px-4 py-2 border-t border-border bg-abyss/80 flex-shrink-0">
-        <span className="text-xs text-muted w-10">{Math.round(progress * 100)}%</span>
-        <div className="flex-1 h-1 rounded-full bg-surface overflow-hidden">
-          <motion.div
-            className="h-full bg-gradient-to-r from-purple to-purple-glow rounded-full"
-            animate={{ width: `${progress * 100}%` }}
-            transition={{ duration: 0.3 }}
-          />
+        <button
+          onClick={goPrev}
+          disabled={chapterIndex === 0}
+          className="p-1.5 rounded text-muted hover:text-bright transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+        >
+          <ChevronLeft size={16} />
+        </button>
+        <div className="flex-1 flex items-center gap-3">
+          <span className="text-xs text-muted w-10 text-right">
+            {Math.round(progress * 100)}%
+          </span>
+          <div className="flex-1 h-1 rounded-full bg-surface overflow-hidden">
+            <motion.div
+              className="h-full bg-gradient-to-r from-purple to-purple-glow rounded-full"
+              animate={{ width: `${progress * 100}%` }}
+              transition={{ duration: 0.3 }}
+            />
+          </div>
+          <span className="text-xs text-muted whitespace-nowrap">
+            {chapterIndex + 1} / {epubData?.spine.length || '?'}
+          </span>
         </div>
-        <BookOpen size={12} className="text-muted" />
+        <button
+          onClick={goNext}
+          disabled={chapterIndex >= (epubData?.spine.length || 1) - 1}
+          className="p-1.5 rounded text-muted hover:text-bright transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+        >
+          <ChevronRight size={16} />
+        </button>
       </div>
     </div>
   );
@@ -443,7 +692,7 @@ function TocTree({ items, onSelect, level }) {
             className="w-full text-left px-4 py-2 text-sm text-text hover:text-bright hover:bg-surface/50 transition-colors leading-snug"
             style={{ paddingLeft: `${16 + level * 16}px` }}
           >
-            {item.label?.trim() || 'Untitled'}
+            {item.label || 'Untitled'}
           </button>
           {item.subitems?.length > 0 && (
             <TocTree items={item.subitems} onSelect={onSelect} level={level + 1} />
