@@ -37,8 +37,11 @@ async function openFileDialog() {
 }
 
 async function extractMetadata(buffer) {
+  // Clone the buffer — ePub consumes/detaches the ArrayBuffer internally,
+  // so the original would be unusable for the actual Reader
+  const bufferCopy = buffer.slice(0);
   const ePub = (await import('epubjs')).default;
-  const book = ePub(buffer);
+  const book = ePub(bufferCopy);
   await book.ready;
 
   const meta = await book.loaded.metadata;
@@ -46,7 +49,6 @@ async function extractMetadata(buffer) {
   try {
     const coverUrl = await book.coverUrl();
     if (coverUrl) {
-      // Convert blob URL to data URL for persistence
       const resp = await fetch(coverUrl);
       const blob = await resp.blob();
       cover = await new Promise((res) => {

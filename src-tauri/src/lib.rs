@@ -11,6 +11,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .invoke_handler(tauri::generate_handler![read_file_bytes])
+        .setup(|app| {
+            let window = app.get_webview_window("main").unwrap();
+            let rgba = include_bytes!("../icons/icon.png");
+            let img = image::load_from_memory(rgba).unwrap().to_rgba8();
+            let (w, h) = img.dimensions();
+            let icon = tauri::image::Image::new_owned(img.into_raw(), w, h);
+            window.set_icon(icon).unwrap();
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

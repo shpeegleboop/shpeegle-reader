@@ -10,7 +10,6 @@
     "beforeBuildCommand": "npm run build"
   },
   "app": {
-    "title": "Shpeegle Reader",
     "windows": [
       {
         "title": "Shpeegle Reader",
@@ -41,13 +40,6 @@
       "icons/icon.ico"
     ]
   },
-  "plugins": {
-    "dialog": {},
-    "fs": {
-      "scope": {
-        "allow": ["**"],
-        "requireLiteralLeadingDot": false
-      }
-    }
-  }
+  "plugins": {}
+
 }
